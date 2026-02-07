@@ -1,9 +1,9 @@
-use std::{collections::HashMap, process::Child};
+use std::collections::HashMap;
 
 use iced::{
     Element,
     Length::Fill,
-    widget::{button, container, text, text_editor::Content},
+    widget::{button, text_editor::Content},
     window::Id,
 };
 use tracing::warn;
@@ -15,12 +15,34 @@ pub enum WindowKind {
     Ai,
 }
 
-#[derive(Default)]
-pub struct WindowManager<M> {
-    windows: HashMap<Id, Box<dyn ChildWindow<M>>>,
+pub enum SgWindow {
+    Ai(AiWindow),
+    Settings,
 }
 
-impl<M> WindowManager<M> {
+impl SgWindow {
+    fn view(&self) -> Element<'_, Event> {
+        match self {
+            SgWindow::Ai(ai_window) => ai_window.view(),
+            SgWindow::Settings => todo!(),
+        }
+    }
+
+    fn update(&mut self, event: ChildEvent) {}
+
+    pub fn sg_window_from_kind(kind: WindowKind) -> SgWindow {
+        match kind {
+            WindowKind::Ai => SgWindow::Ai(AiWindow::default()),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct WindowManager {
+    windows: HashMap<Id, SgWindow>,
+}
+
+impl WindowManager {
     pub fn view(&self, id: Id) -> Option<iced::Element<'_, Event>> {
         self.windows.get(&id).map(|w| w.view())
     }
@@ -33,21 +55,13 @@ impl<M> WindowManager<M> {
         }
     }
 
-    pub fn insert<W>(&mut self, id: Id, window: W)
-    where
-        W: ChildWindow<M> + 'static,
-    {
-        self.windows.insert(id, Box::new(window));
+    pub fn insert(&mut self, id: Id, window: SgWindow) {
+        self.windows.insert(id, window);
     }
 
     pub fn remove(&mut self, id: &Id) {
         self.windows.remove(id);
     }
-}
-
-pub trait ChildWindow<M> {
-    fn view(&self) -> iced::Element<'_, Event>;
-    fn update(&mut self, event: ChildEvent);
 }
 
 pub struct AiWindow {
@@ -73,7 +87,7 @@ impl From<AiEvent> for Event {
     }
 }
 
-impl<M> ChildWindow<M> for AiWindow {
+impl AiWindow {
     fn view(&self) -> iced::Element<'_, Event> {
         iced::widget::column!(
             iced::widget::text_editor(&self.chat_content).height(Fill),

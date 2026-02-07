@@ -19,13 +19,13 @@ use rmpv::Value;
 use tracing::{error, trace, warn};
 use tracing_subscriber::{Registry, fmt::Layer, layer::SubscriberExt};
 
-use crate::window_manager::{AiEvent, AiWindow, WindowKind, WindowManager};
+use crate::window_manager::{AiEvent, AiWindow, SgWindow, WindowKind, WindowManager};
 
 #[derive(Default)]
 struct ShellApp {
     sender: Option<Sender<String>>,
     neovim: Option<Neovim<Compat<tokio::fs::File>>>,
-    wm: WindowManager<Event>,
+    wm: WindowManager,
 }
 
 impl ShellApp {
@@ -47,6 +47,10 @@ impl ShellApp {
     fn update(&mut self, message: Event) -> Task<Event> {
         match message {
             Event::Noop => Task::none(),
+            Event::Error(e) => {
+                error!(e);
+                Task::none()
+            }
             Event::Todo => {
                 trace!("message recieved");
                 Task::none()
@@ -81,7 +85,7 @@ impl ShellApp {
             }
             Event::WindowOpened { id, kind } => {
                 let window = match kind {
-                    WindowKind::Ai => AiWindow::default(),
+                    WindowKind::Ai => SgWindow::sg_window_from_kind(kind),
                 };
                 self.wm.insert(id, window);
                 Task::none()
@@ -100,7 +104,18 @@ impl ShellApp {
             }
             Event::RequestSendNeovimCommand(s) => {
                 if let Some(client) = self.neovim.clone() {
-                    return Task::perform(async move { client.command(&s).await }, |_| Event::Noop);
+                    return Task::perform(
+                        async move {
+                            match client.command(&s).await {
+                                Ok(_) => Event::Noop,
+                                Err(e) => Event::Error(format!(
+                                    "Error when sending command to neovim: {}",
+                                    e
+                                )),
+                            }
+                        },
+                        |event| event,
+                    );
                 }
                 Task::none()
             }
@@ -121,6 +136,7 @@ impl ShellApp {
 enum Event {
     #[default]
     Noop,
+    Error(String),
     Todo,
     OpenWindowRequested(WindowKind),
     WindowOpened {
@@ -138,6 +154,7 @@ impl Debug for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Noop => write!(f, "Noop"),
+            Event::Error(e) => f.debug_tuple("Error").field(e).finish(),
             Self::Todo => write!(f, "Todo"),
             Self::OpenWindowRequested(arg0) => {
                 f.debug_tuple("OpenWindowRequested").field(arg0).finish()

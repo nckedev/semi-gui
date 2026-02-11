@@ -1,9 +1,14 @@
+mod agent;
+mod ai;
 mod commands;
+mod prompt;
+mod strings;
 mod window_manager;
 
 use std::{fmt::Debug, fs::File};
 
 use async_trait::async_trait;
+use dotenv::dotenv;
 use iced::{
     Element, Subscription, Task,
     futures::{
@@ -11,35 +16,41 @@ use iced::{
         channel::mpsc::{self, Sender},
     },
     stream,
-    widget::text,
     window::{self, Id},
 };
 use nvim_rs::{Handler, Neovim, compat::tokio::Compat, create};
 use rmpv::Value;
-use tracing::{error, trace, warn};
-use tracing_subscriber::{Registry, fmt::Layer, layer::SubscriberExt};
+use tracing::{error, info, trace, warn};
+use tracing_subscriber::{Registry, filter, fmt::Layer, layer::SubscriberExt};
 
-use crate::window_manager::{AiEvent, AiWindow, SgWindow, WindowKind, WindowManager};
+use crate::{
+    agent::agent::AgentEvent,
+    ai::ai::{AiClient, ClientBuilder, Request, Response},
+    prompt::Prompt,
+    window_manager::{SgWindow, WindowKind, WindowManager},
+};
 
-#[derive(Default)]
 struct ShellApp {
     sender: Option<Sender<String>>,
     neovim: Option<Neovim<Compat<tokio::fs::File>>>,
+    aiclient: Box<dyn AiClient>,
     wm: WindowManager,
 }
 
 impl ShellApp {
     fn new() -> (Self, Task<Event>) {
-        let (id, open) = window::open(window::Settings::default());
+        let (_id, open) = window::open(window::Settings::default());
         (
             Self {
                 sender: None,
-                ..Default::default()
+                aiclient: ClientBuilder::openai().expect("failed to create open ai client "),
+                neovim: None,
+                wm: WindowManager::default(),
             },
             // Task::none(),
             open.map(move |id| Event::WindowOpened {
                 id,
-                kind: WindowKind::Ai,
+                kind: WindowKind::Agent,
             }),
         )
     }
@@ -55,7 +66,7 @@ impl ShellApp {
                 trace!("message recieved");
                 Task::none()
             }
-            Event::NeovimHostReady(sender) => {
+            Event::NeovimWorkerReady(sender) => {
                 trace!("nvim ready");
                 self.sender = Some(sender.clone());
                 // let handler = NvimHandler {};
@@ -85,7 +96,7 @@ impl ShellApp {
             }
             Event::WindowOpened { id, kind } => {
                 let window = match kind {
-                    WindowKind::Ai => SgWindow::sg_window_from_kind(kind),
+                    WindowKind::Agent => SgWindow::sg_window_from_kind(id, kind),
                 };
                 self.wm.insert(id, window);
                 Task::none()
@@ -119,6 +130,37 @@ impl ShellApp {
                 }
                 Task::none()
             }
+            Event::AskClanker(id, kind, prompt) => {
+                let client = self.aiclient.clone_box();
+                // TODO: do the prompt transformation here, include files, lsp queries etc...
+                let task1 = Task::perform(
+                    async move {
+                        let s = prompt.expand();
+                        match client.send(Request::new(s)).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::error!("{:?}", e);
+                                Response::error(&format!("{e:?}"))
+                            }
+                        }
+                    },
+                    move |event| {
+                        if kind == WindowKind::Agent {
+                            AgentEvent::ResponseRecived(event).into_event(id)
+                        } else {
+                            Event::Noop
+                        }
+                    },
+                );
+
+                let task2 = if kind == WindowKind::Agent {
+                    Task::done(AgentEvent::PressedSend.into_event(id))
+                } else {
+                    Task::none()
+                };
+
+                Task::batch([task2, task1])
+            }
         }
     }
 
@@ -144,10 +186,11 @@ enum Event {
         kind: WindowKind,
     },
     WindowClosed(Id),
-    NeovimHostReady(Sender<String>),
+    NeovimWorkerReady(Sender<String>),
     ChildEvent(Id, ChildEvent),
     NeovimClientReady(Neovim<Compat<tokio::fs::File>>),
     RequestSendNeovimCommand(String),
+    AskClanker(Id, WindowKind, Prompt),
 }
 
 impl Debug for Event {
@@ -165,7 +208,7 @@ impl Debug for Event {
                 .field("kind", kind)
                 .finish(),
             Self::WindowClosed(arg0) => f.debug_tuple("WindowClosed").field(arg0).finish(),
-            Self::NeovimHostReady(arg0) => f.debug_tuple("NeovimHostReady").field(arg0).finish(),
+            Self::NeovimWorkerReady(arg0) => f.debug_tuple("NeovimHostReady").field(arg0).finish(),
             Self::ChildEvent(arg0, arg1) => {
                 f.debug_tuple("ChildEvent").field(arg0).field(arg1).finish()
             }
@@ -174,22 +217,30 @@ impl Debug for Event {
                 .debug_tuple("RequestSendNeovimCommand")
                 .field(arg0)
                 .finish(),
+            Self::AskClanker(_, _, _) => write!(f, "clanker"),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 enum ChildEvent {
-    Ai(AiEvent),
+    Agent(AgentEvent),
+    Chat,
 }
 
 fn main() -> iced::Result {
+    dotenv().ok();
     std::panic::set_hook(Box::new(move |panic| {
         error!("----- Panic -----");
         error!("{}", panic);
     }));
+
     let logfile = File::create("log.txt").unwrap();
-    // let writer = BufWriter::new(logfile);
+
+    let filter = filter::Targets::new()
+        .with_target("winit", tracing::Level::INFO)
+        .with_default(tracing::Level::DEBUG);
+
     let file_layer = Layer::default()
         .with_writer(logfile)
         .with_line_number(true)
@@ -199,14 +250,12 @@ fn main() -> iced::Result {
         .with_level(true)
         .with_thread_names(true);
 
-    let subscriber = Registry::default().with(file_layer);
+    let subscriber = Registry::default().with(file_layer).with(filter);
     let _ = tracing::subscriber::set_global_default(subscriber);
 
     iced::daemon(ShellApp::new, ShellApp::update, ShellApp::view)
         .subscription(ShellApp::sub)
-        .run();
-
-    Ok(())
+        .run()
 }
 
 #[derive(Clone, Debug)]
@@ -221,28 +270,25 @@ impl Handler for NvimHandler {
     #[tracing::instrument(skip(_neovim))]
     async fn handle_notify(
         &self,
-        _name: String,
-        _args: Vec<Value>,
+        name: String,
+        args: Vec<Value>,
         _neovim: Neovim<<Self as Handler>::Writer>,
     ) {
         trace!("handle notify");
-        let mut s = self.sender.clone().expect("failed to clone sender");
-        match _name.as_ref() {
-            "test" => match _neovim.command(r#"!ls"#).await {
-                Ok(_) => {
-                    trace!("Send command ok");
-                    s.send("test".to_string()).await;
-                }
-                Err(e) => error!("Send command error: {}", e),
-            },
-            "ai" => {
-                s.send("ai".to_string()).await;
-            }
+        let mut sender = self.sender.clone().expect("failed to clone sender");
+        let value = match name.as_ref() {
+            "test" => "test".to_string(),
+            "ai" => "ai".to_string(),
+            "init" => "init".to_string(),
             x => {
                 warn!("unhandled value: {}", x);
-                panic!("panic for now");
+                x.to_string()
             }
         };
+
+        if let Err(e) = sender.send(value).await {
+            error!("Send error: {} ", e)
+        }
     }
 }
 
@@ -254,7 +300,7 @@ fn nvim_worker() -> impl Stream<Item = Event> {
         trace!("channel");
         let (sender, mut reciever) = mpsc::channel(100);
 
-        let _ = output.send(Event::NeovimHostReady(sender)).await;
+        let _ = output.send(Event::NeovimWorkerReady(sender)).await;
 
         loop {
             use iced_futures::futures::StreamExt;
@@ -263,10 +309,12 @@ fn nvim_worker() -> impl Stream<Item = Event> {
             #[allow(clippy::single_match)]
             let event = match input.as_str() {
                 "test" => Event::Todo,
-                "ai" => Event::OpenWindowRequested(WindowKind::Ai),
+                "ai" => Event::OpenWindowRequested(WindowKind::Agent),
                 _ => Event::Noop,
             };
             output.send(event).await;
         }
     })
 }
+
+struct Session {}

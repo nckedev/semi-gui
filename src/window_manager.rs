@@ -1,38 +1,39 @@
 use std::collections::HashMap;
 
-use iced::{
-    Element,
-    Length::Fill,
-    widget::{button, text_editor::Content},
-    window::Id,
-};
+use iced::{Element, window::Id};
+
 use tracing::warn;
 
-use crate::{ChildEvent, Event};
+use crate::{ChildEvent, Event, agent::agent::AgentWindow};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WindowKind {
-    Ai,
+    Agent,
 }
 
 pub enum SgWindow {
-    Ai(AiWindow),
+    Agent(AgentWindow),
     Settings,
 }
 
 impl SgWindow {
     fn view(&self) -> Element<'_, Event> {
         match self {
-            SgWindow::Ai(ai_window) => ai_window.view(),
+            SgWindow::Agent(agent) => agent.view(),
             SgWindow::Settings => todo!(),
         }
     }
 
-    fn update(&mut self, event: ChildEvent) {}
+    fn update(&mut self, event: ChildEvent) {
+        match self {
+            SgWindow::Agent(agent) => agent.update(event),
+            SgWindow::Settings => todo!(),
+        }
+    }
 
-    pub fn sg_window_from_kind(kind: WindowKind) -> SgWindow {
+    pub fn sg_window_from_kind(id: Id, kind: WindowKind) -> SgWindow {
         match kind {
-            WindowKind::Ai => SgWindow::Ai(AiWindow::default()),
+            WindowKind::Agent => SgWindow::Agent(AgentWindow::new(id)),
         }
     }
 }
@@ -61,46 +62,5 @@ impl WindowManager {
 
     pub fn remove(&mut self, id: &Id) {
         self.windows.remove(id);
-    }
-}
-
-pub struct AiWindow {
-    chat_content: Content,
-}
-
-impl Default for AiWindow {
-    fn default() -> Self {
-        Self {
-            chat_content: Content::with_text("234"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum AiEvent {
-    Todo,
-}
-
-impl From<AiEvent> for Event {
-    fn from(value: AiEvent) -> Self {
-        todo!()
-    }
-}
-
-impl AiWindow {
-    fn view(&self) -> iced::Element<'_, Event> {
-        iced::widget::column!(
-            iced::widget::text_editor(&self.chat_content).height(Fill),
-            button("test").on_press(Event::RequestSendNeovimCommand("!ls".to_string()))
-        )
-        .into()
-    }
-
-    fn update(&mut self, event: ChildEvent) {
-        if let ChildEvent::Ai(event) = event {
-            match event {
-                AiEvent::Todo => todo!(),
-            }
-        }
     }
 }

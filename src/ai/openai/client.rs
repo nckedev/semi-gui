@@ -18,10 +18,13 @@ pub(crate) struct OpenAIClient {
 #[async_trait]
 impl AiClient for OpenAIClient {
     async fn send(&self, content: Request) -> Result<Response, AiErr> {
+        tracing::info!("prev id: {}", &content.input);
         let oc = OpenAiRequest {
             model: "gpt-5.2".to_string(),
             input: content.input,
+            previous_response_id: content.prev_id,
         };
+
         let res = self
             .http_client
             .post(strings::OPENAI_URL)
@@ -32,24 +35,28 @@ impl AiClient for OpenAIClient {
             .error_for_status()
             .map_err(|e| {
                 tracing::error!("{}", e);
-                AiErr::HeaderErr
+                AiErr::Custom(format!("{}", e))
             })?
             // .text()
             .json::<types::Response>()
             .await
-            .unwrap();
+            .map_err(|e| {
+                tracing::error!("{}", e);
+                AiErr::Custom(format!("{}", e))
+            })?;
 
         tracing::debug!("response {:?}", res);
 
+        let res_id = res.id.clone();
         let r = match &res.output[0] {
-            types::ResponseOutputItem::ResponseOutputMessage { id, content, .. } => {
+            types::ResponseOutputItem::ResponseOutputMessage { content, .. } => {
                 match content.as_slice() {
                     [ResponseOutputText::OutputText { text, .. }, ..] => Response {
-                        id: id.clone(),
+                        id: res_id,
                         content: text.clone(),
                     },
                     [ResponseOutputText::Refusal { refusal }, ..] => Response {
-                        id: id.clone(),
+                        id: res_id,
                         content: refusal.clone(),
                     },
                     _ => Err(AiErr::Custom("failed to parse".to_string()))?,
@@ -75,4 +82,5 @@ impl Clone for Box<dyn AiClient> {
 struct OpenAiRequest {
     model: String,
     input: String,
+    previous_response_id: Option<String>,
 }

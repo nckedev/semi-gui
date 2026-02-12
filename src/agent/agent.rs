@@ -1,9 +1,14 @@
-use std::{fmt::Display, ops::Shr};
+use std::{
+    collections::HashMap,
+    fmt::{Debug, Display},
+    ops::{Add, Mul, Sub},
+    time::{Duration, Instant},
+};
 
 use iced::{
-    Alignment, Background, Border, Color, Element, Font,
+    Alignment, Background, Element, Font,
     Length::{Fill, Shrink},
-    Padding, Theme, color,
+    Padding, color,
     widget::{
         self, container,
         text_editor::{Action, Content},
@@ -12,9 +17,7 @@ use iced::{
 };
 use iced_ext::IcedExt;
 
-use crate::{
-    ChildEvent, Event, agent::block, ai::ai::Response, prompt::Prompt, window_manager::WindowKind,
-};
+use crate::{ChildEvent, Event, ai::ai::Response, prompt::Prompt, window_manager::WindowKind};
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -23,6 +26,7 @@ pub enum AgentEvent {
     ResponseRecived(Response),
     InputEdit(Action),
     PressedSend,
+    SideBarCollapse,
 }
 
 impl AgentEvent {
@@ -39,6 +43,11 @@ pub struct AgentWindow {
     input_box: Content,
     is_busy: bool,
     mode: AgentMode,
+    prev_id: Option<String>,
+    sidebar_width: Animated<f32>,
+    sidebar_collapsed: bool,
+    session: HashMap<String, String>,
+    selected_session: String,
 }
 
 impl AgentWindow {
@@ -51,6 +60,11 @@ impl AgentWindow {
             input_box: Content::new(),
             is_busy: false,
             mode: AgentMode::Chat,
+            prev_id: None,
+            session: HashMap::new(),
+            selected_session: String::from(""),
+            sidebar_width: Animated::new(100.),
+            sidebar_collapsed: false,
         }
     }
 
@@ -69,12 +83,34 @@ impl AgentWindow {
                 Some(Event::AskClanker(
                     self.id,
                     WindowKind::Agent,
+                    self.prev_id.clone(),
                     Prompt::from(self.input_box.text().clone()),
                 ))
             } else {
                 None
             },
         );
+
+        let sessions = widget::column![
+            widget::row![
+                if !self.sidebar_collapsed {
+                    Some(widget::text("Sessions"))
+                } else {
+                    None
+                },
+                widget::space::horizontal(),
+                widget::button("<>").on_press(AgentEvent::SideBarCollapse.into_event(self.id))
+            ],
+            widget::text("test")
+        ]
+        .width(Fill)
+        .container()
+        .style(|_t| container::Style {
+            background: Some(Background::Color(color!(0xff0000))),
+            ..Default::default()
+        })
+        .height(Fill)
+        .width(self.sidebar_width.value());
 
         let bottom_row = widget::row![widget::text(self.mode.to_string())]
             .width(Fill)
@@ -87,27 +123,52 @@ impl AgentWindow {
             .padding(Padding::new(0.).horizontal(10).bottom(5));
 
         widget::column![
-            chat_content(self),
-            iced::widget::stack![
-                input_box,
-                btn.container()
-                    .height(Fill)
-                    .width(Fill)
-                    .align_y(Alignment::End)
-                    .align_x(Alignment::End)
+            widget::row![widget::space::horizontal(), widget::text("test")]
+                .height(30)
+                .align_y(Alignment::Center)
+                .padding(Padding::new(0.).right(10.)),
+            widget::row![
+                widget::row![sessions],
+                widget::column![
+                    chat_content(self),
+                    iced::widget::stack![
+                        input_box,
+                        btn.container()
+                            .height(Fill)
+                            .width(Fill)
+                            .align_y(Alignment::End)
+                            .align_x(Alignment::End)
+                    ]
+                    .container()
+                    .padding(Padding::new(0.).horizontal(10))
+                    .align_y(Alignment::End),
+                    bottom_row
+                ]
             ]
-            .container()
-            .padding(Padding::new(0.).horizontal(10))
-            .align_y(Alignment::End),
-            bottom_row
+            .height(Fill)
         ]
-        .height(Fill)
         .into()
+    }
+
+    pub fn animate(&mut self, now: Instant) {
+        self.sidebar_width.update(now);
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.sidebar_width.is_animating()
     }
 
     pub fn update(&mut self, event: ChildEvent) {
         if let ChildEvent::Agent(event) = event {
             match event {
+                AgentEvent::SideBarCollapse => {
+                    self.sidebar_collapsed = !self.sidebar_collapsed;
+                    if self.sidebar_collapsed {
+                        self.sidebar_width.animate_to(50., 200, 0)
+                    } else {
+                        self.sidebar_width.animate_to(100., 200, 0)
+                    }
+                }
                 AgentEvent::Todo => {}
                 AgentEvent::InputChanged(s) => {
                     // self.chat.push(Block { content: s.clone() });
@@ -117,6 +178,7 @@ impl AgentWindow {
                 }
                 AgentEvent::ResponseRecived(r) => {
                     self.is_busy = false;
+                    self.prev_id = Some(r.id);
                     self.chat.push(Block {
                         content: r.content.clone(),
                     })
@@ -225,6 +287,10 @@ pub struct Block {
     content: String,
 }
 
+pub struct Session {
+    prev_id: String,
+}
+
 struct Keyword<'a> {
     start: usize,
     end: usize,
@@ -241,4 +307,98 @@ enum KeywordKind {
     Lsp,
     // #
     Template,
+}
+
+pub struct Animated<T>
+where
+    T: Add<T> + Sub<T>,
+{
+    status: AnimationStatus,
+    current: T,
+    start: T,
+    target: T,
+    start_time: Option<Instant>,
+    duration: Duration,
+    delta: T,
+    delay: Duration,
+}
+
+// TODO: Sequence animations (keyframes?)
+
+impl<T> Animated<T>
+where
+    T: Add<Output = T> + Sub<Output = T> + Mul<Output = T> + Copy + Default + From<f32> + Debug,
+{
+    pub fn new(starting_value: f32) -> Self {
+        Self {
+            status: AnimationStatus::Idle,
+            current: starting_value.into(),
+            start: T::from(starting_value),
+            target: T::default(),
+            start_time: None,
+            duration: Duration::from_millis(100),
+            delta: T::default(),
+            delay: Duration::from_millis(0),
+        }
+    }
+
+    pub fn is_animating(&self) -> bool {
+        matches!(self.status, AnimationStatus::Running)
+    }
+    pub fn update(&mut self, tick: Instant) {
+        if self.status == AnimationStatus::Idle {
+            return;
+        }
+        let Some(start_time) = self.start_time else {
+            self.status = AnimationStatus::Idle;
+            return;
+        };
+        if tick - start_time >= self.duration + self.delay {
+            self.status = AnimationStatus::Idle;
+            return;
+        }
+        let elapsed = tick - start_time;
+        // if elapsed < self.delay {
+        //     return;
+        // }
+        let progress = elapsed.as_secs_f32() / self.duration.as_secs_f32();
+        assert!(progress <= 1.);
+        self.current = self.start + (self.delta * T::from(progress));
+    }
+
+    pub fn animate_to(&mut self, target: T, dur: u64, delay: u64)
+    where
+        T: Add<T> + Sub<T> + Copy + Default,
+    {
+        assert!(dur > 0);
+        self.delay = Duration::from_millis(delay);
+        self.duration = Duration::from_millis(dur);
+        self.target = target;
+        self.start_time = Some(Instant::now());
+        self.delta = target - self.current;
+        self.start = self.current;
+        self.status = AnimationStatus::Running;
+    }
+
+    pub fn value(&self) -> T {
+        self.current
+    }
+
+    pub fn value_ref(&self) -> &T {
+        &self.current
+    }
+}
+
+// fn lerp<T>(a: T, b: T, t: T) -> T
+// where
+//     T: Add<Output = T> + Sub<Output = T> + Mul<Output = T> + Copy + Default + From<f32> + Debug,
+// {
+//     assert!(t > T::from(0.) && t < T::from(1.));
+//     a + (b - a) * t
+// }
+//
+#[derive(Debug, PartialEq)]
+pub enum AnimationStatus {
+    Idle,
+    Running,
 }

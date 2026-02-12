@@ -5,26 +5,32 @@ mod prompt;
 mod strings;
 mod window_manager;
 
-use std::{fmt::Debug, fs::File};
+use std::{
+    fmt::Debug,
+    fs::File,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use dotenv::dotenv;
 use iced::{
-    Element, Subscription, Task,
+    Element, Subscription, Task, event,
     futures::{
         SinkExt, Stream,
         channel::mpsc::{self, Sender},
     },
+    keyboard::{self, Key, Modifiers, key::Named},
     stream,
-    window::{self, Id},
+    window::{self, Id, settings::PlatformSpecific},
 };
+use iced_futures::backend::default::time;
 use nvim_rs::{Handler, Neovim, compat::tokio::Compat, create};
 use rmpv::Value;
 use tracing::{error, info, trace, warn};
 use tracing_subscriber::{Registry, filter, fmt::Layer, layer::SubscriberExt};
 
 use crate::{
-    agent::agent::AgentEvent,
+    agent::agent::{AgentEvent, AgentWindow},
     ai::ai::{AiClient, ClientBuilder, Request, Response},
     prompt::Prompt,
     window_manager::{SgWindow, WindowKind, WindowManager},
@@ -35,17 +41,28 @@ struct ShellApp {
     neovim: Option<Neovim<Compat<tokio::fs::File>>>,
     aiclient: Box<dyn AiClient>,
     wm: WindowManager,
+    is_animating: bool,
+    focused_window: Option<Id>,
 }
 
 impl ShellApp {
     fn new() -> (Self, Task<Event>) {
-        let (_id, open) = window::open(window::Settings::default());
+        let (_id, open) = window::open(window::Settings {
+            platform_specific: PlatformSpecific {
+                fullsize_content_view: true,
+                title_hidden: false,
+                titlebar_transparent: true,
+            },
+            ..Default::default()
+        });
         (
             Self {
                 sender: None,
                 aiclient: ClientBuilder::openai().expect("failed to create open ai client "),
                 neovim: None,
                 wm: WindowManager::default(),
+                is_animating: false,
+                focused_window: None,
             },
             // Task::none(),
             open.map(move |id| Event::WindowOpened {
@@ -57,6 +74,10 @@ impl ShellApp {
 
     fn update(&mut self, message: Event) -> Task<Event> {
         match message {
+            Event::Animate => {
+                self.is_animating = true;
+                Task::none()
+            }
             Event::Noop => Task::none(),
             Event::Error(e) => {
                 error!(e);
@@ -64,6 +85,11 @@ impl ShellApp {
             }
             Event::Todo => {
                 trace!("message recieved");
+                Task::none()
+            }
+            Event::Tick(instant) => {
+                // TODO: this needs to be better
+                self.wm.animate(instant);
                 Task::none()
             }
             Event::NeovimWorkerReady(sender) => {
@@ -78,7 +104,7 @@ impl ShellApp {
                     async move {
                         trace!("creating parent");
                         match create::tokio::new_parent(handler).await {
-                            Ok((nvim, io)) => {
+                            Ok((nvim, _io)) => {
                                 trace!("spawnig io");
                                 nvim
                             }
@@ -130,17 +156,20 @@ impl ShellApp {
                 }
                 Task::none()
             }
-            Event::AskClanker(id, kind, prompt) => {
+            Event::AskClanker(id, kind, prev_id, prompt) => {
                 let client = self.aiclient.clone_box();
                 // TODO: do the prompt transformation here, include files, lsp queries etc...
                 let task1 = Task::perform(
                     async move {
                         let s = prompt.expand();
-                        match client.send(Request::new(s)).await {
+                        let mut request = Request::new(s);
+                        request.prev_id = prev_id;
+                        match client.send(request).await {
                             Ok(r) => r,
                             Err(e) => {
                                 tracing::error!("{:?}", e);
-                                Response::error(&format!("{e:?}"))
+                                panic!("send request fail")
+                                // Response::error(&format!("{e:?}"))
                             }
                         }
                     },
@@ -161,6 +190,42 @@ impl ShellApp {
 
                 Task::batch([task2, task1])
             }
+            Event::WindowEvent(id, event) => {
+                // tracing::info!("{:?}", event);
+                match event {
+                    window::Event::Closed => {}
+                    window::Event::RedrawRequested(_instant) => {}
+                    window::Event::CloseRequested => {}
+                    window::Event::Focused => self.focused_window = Some(id),
+                    window::Event::Unfocused => self.focused_window = None,
+                    _ => {}
+                }
+                Task::none()
+            }
+            Event::KbdEvent(event) => {
+                let Some(id) = self.focused_window else {
+                    return Task::none();
+                };
+                if self.wm.is_agent(id) {
+                    match event {
+                        keyboard::Event::KeyPressed {
+                            key,
+                            modifiers: Modifiers::LOGO,
+                            ..
+                        } => {
+                            if key == Key::Named(Named::Enter) {
+                                self.wm
+                                    .update(id, ChildEvent::Agent(AgentEvent::PressedSend))
+                            }
+                            if key == Key::Character("p".into()) {}
+                        }
+                        keyboard::Event::KeyReleased { .. } => {}
+                        keyboard::Event::ModifiersChanged(_modifiers) => {}
+                        _ => {}
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -170,16 +235,25 @@ impl ShellApp {
     }
 
     fn sub(&self) -> Subscription<Event> {
-        Subscription::run(nvim_worker)
+        let kbd_event = keyboard::listen().map(Event::KbdEvent);
+        let window_event = window::events().map(|(id, event)| Event::WindowEvent(id, event));
+        let nvim = Subscription::run(nvim_worker);
+        if self.wm.is_animating() {
+            let ticker = time::every(Duration::from_millis(16)).map(Event::Tick);
+            return Subscription::batch([nvim, ticker, window_event, kbd_event]);
+        }
+        Subscription::batch([nvim, window_event, kbd_event])
     }
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Default, Clone)]
 enum Event {
     #[default]
     Noop,
     Error(String),
     Todo,
+    Tick(Instant),
     OpenWindowRequested(WindowKind),
     WindowOpened {
         id: Id,
@@ -190,7 +264,10 @@ enum Event {
     ChildEvent(Id, ChildEvent),
     NeovimClientReady(Neovim<Compat<tokio::fs::File>>),
     RequestSendNeovimCommand(String),
-    AskClanker(Id, WindowKind, Prompt),
+    AskClanker(Id, WindowKind, Option<String>, Prompt),
+    Animate,
+    WindowEvent(Id, iced::window::Event),
+    KbdEvent(iced::keyboard::Event),
 }
 
 impl Debug for Event {
@@ -198,6 +275,7 @@ impl Debug for Event {
         match self {
             Self::Noop => write!(f, "Noop"),
             Event::Error(e) => f.debug_tuple("Error").field(e).finish(),
+            Self::Tick(instant) => f.debug_tuple("Tick").field(instant).finish(),
             Self::Todo => write!(f, "Todo"),
             Self::OpenWindowRequested(arg0) => {
                 f.debug_tuple("OpenWindowRequested").field(arg0).finish()
@@ -217,7 +295,8 @@ impl Debug for Event {
                 .debug_tuple("RequestSendNeovimCommand")
                 .field(arg0)
                 .finish(),
-            Self::AskClanker(_, _, _) => write!(f, "clanker"),
+            Self::AskClanker(_, _, _, _) => write!(f, "clanker"),
+            _ => write!(f, "debug not implemented"),
         }
     }
 }

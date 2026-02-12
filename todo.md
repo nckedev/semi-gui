@@ -11,5 +11,6 @@
 - hover
 - project management (kanban?, todo comments?) links 
 - colorpicker 
+- read and set qf list 
 
 

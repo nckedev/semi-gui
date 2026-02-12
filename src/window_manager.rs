@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, hash_map},
+    time::Instant,
+};
 
 use iced::{Element, window::Id};
 
@@ -31,6 +34,20 @@ impl SgWindow {
         }
     }
 
+    fn animate(&mut self, now: Instant) {
+        match self {
+            SgWindow::Agent(agent) => agent.animate(now),
+            _ => {}
+        }
+    }
+
+    fn is_animating(&self) -> bool {
+        match self {
+            SgWindow::Agent(agent) => agent.is_animating(),
+            _ => false,
+        }
+    }
+
     pub fn sg_window_from_kind(id: Id, kind: WindowKind) -> SgWindow {
         match kind {
             WindowKind::Agent => SgWindow::Agent(AgentWindow::new(id)),
@@ -56,11 +73,34 @@ impl WindowManager {
         }
     }
 
+    pub fn animate(&mut self, now: Instant) {
+        for w in self.windows.values_mut() {
+            w.animate(now);
+        }
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.windows.iter().all(|(_, w)| w.is_animating())
+    }
+
     pub fn insert(&mut self, id: Id, window: SgWindow) {
         self.windows.insert(id, window);
     }
 
     pub fn remove(&mut self, id: &Id) {
         self.windows.remove(id);
+    }
+
+    pub fn iter(&self) -> hash_map::Iter<'_, Id, SgWindow> {
+        self.windows.iter()
+    }
+
+    pub fn is_agent(&self, id: Id) -> bool {
+        if let Some(wnd) = self.windows.get(&id)
+            && matches!(wnd, SgWindow::Agent(..))
+        {
+            return true;
+        }
+        false
     }
 }

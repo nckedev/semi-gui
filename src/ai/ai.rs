@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
 
 use crate::{ai::openai::client::OpenAIClient, strings};
 
@@ -54,6 +53,7 @@ pub struct Request {
     pub input: String,
     pub format: ResponseFormat,
     pub tools: Vec<Tool>,
+    pub prev_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -69,11 +69,17 @@ impl Request {
             model: "gpt-5.2".to_string(),
             format: ResponseFormat::Text,
             tools: vec![],
+            prev_id: None,
         }
     }
 
     pub fn with_tool(mut self, tool: Tool) -> Self {
         self.tools.push(tool);
+        self
+    }
+
+    pub fn with_prev_id(mut self, id: String) -> Self {
+        self.prev_id = Some(id);
         self
     }
 }

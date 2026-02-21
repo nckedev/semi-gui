@@ -1,37 +1,45 @@
 mod agent;
 mod ai;
+mod animated;
 mod commands;
+mod components;
+mod nvim_types;
 mod prompt;
+mod settings;
 mod strings;
+mod style;
 mod window_manager;
 
 use std::{
     fmt::Debug,
     fs::File,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use dotenv::dotenv;
 use iced::{
-    Element, Subscription, Task, event,
+    Element, Subscription, Task, Theme, Window, color,
     futures::{
         SinkExt, Stream,
         channel::mpsc::{self, Sender},
     },
     keyboard::{self, Key, Modifiers, key::Named},
     stream,
+    theme::{Custom, Palette},
     window::{self, Id, settings::PlatformSpecific},
 };
 use iced_futures::backend::default::time;
 use nvim_rs::{Handler, Neovim, compat::tokio::Compat, create};
 use rmpv::Value;
-use tracing::{error, info, trace, warn};
+use tracing::{error, trace, warn};
 use tracing_subscriber::{Registry, filter, fmt::Layer, layer::SubscriberExt};
 
 use crate::{
-    agent::agent::{AgentEvent, AgentWindow},
+    agent::agent::AgentEvent,
     ai::ai::{AiClient, ClientBuilder, Request, Response},
+    nvim_types::NvimResponse,
     prompt::Prompt,
     window_manager::{SgWindow, WindowKind, WindowManager},
 };
@@ -72,6 +80,21 @@ impl ShellApp {
         )
     }
 
+    fn theme(&self, _window: Id) -> Option<Theme> {
+        Some(Theme::Custom(Arc::new(Custom::new(
+            "test".to_string(),
+            Palette {
+                background: color!(0xfffdf9),
+                text: color!(0x181818),
+                primary: color!(0xeba431),
+                success: color!(0x00ff00),
+                warning: color!(0xf00000),
+                danger: color!(0xff0000),
+            },
+        ))))
+    }
+
+    /// the main update loop
     fn update(&mut self, message: Event) -> Task<Event> {
         match message {
             Event::Animate => {
@@ -109,6 +132,7 @@ impl ShellApp {
                                 nvim
                             }
                             Err(e) => {
+                                tracing::error!("error in parent: {}", e);
                                 panic!("ee");
                             }
                         }
@@ -117,38 +141,62 @@ impl ShellApp {
                 )
             }
             Event::OpenWindowRequested(kind) => {
+                match kind {
+                    // settings can only have once instance
+                    WindowKind::Settings => {
+                        if let Some(id) = self.wm.find_first(kind) {
+                            return window::gain_focus(id);
+                        }
+                    }
+                    _ => {}
+                }
                 let (_id, open) = window::open(window::Settings::default());
                 open.map(move |id| Event::WindowOpened { id, kind })
             }
             Event::WindowOpened { id, kind } => {
-                let window = match kind {
-                    WindowKind::Agent => SgWindow::sg_window_from_kind(id, kind),
-                };
+                // let window = match kind {
+                //     WindowKind::Agent => SgWindow::sg_window_from_kind(id, kind),
+                // };
+                let window = SgWindow::sg_window_from_kind(id, kind);
                 self.wm.insert(id, window);
                 Task::none()
             }
-            Event::WindowClosed(id) => {
-                self.wm.remove(&id);
-                window::close(id)
-            }
-            Event::ChildEvent(id, child) => {
-                self.wm.update(id, child);
-                Task::none()
-            }
+            Event::WindowClosed(id) => window::close(id),
+            Event::ChildEvent(id, child) => self.wm.update(id, child),
             Event::NeovimClientReady(client) => {
                 self.neovim = Some(client);
                 Task::none()
             }
-            Event::RequestSendNeovimCommand(s) => {
+            Event::RequestSendNeovimCommand {
+                command,
+                arg,
+                id,
+                callback,
+            } => {
                 if let Some(client) = self.neovim.clone() {
                     return Task::perform(
                         async move {
-                            match client.command(&s).await {
-                                Ok(_) => Event::Noop,
-                                Err(e) => Event::Error(format!(
-                                    "Error when sending command to neovim: {}",
-                                    e
-                                )),
+                            if let Some(arg) = arg {
+                                match client.command_output(&format!("{} {}", command, arg)).await {
+                                    Ok(s) => callback(s, id),
+                                    Err(e) => {
+                                        tracing::error!("{}", e);
+                                        // TODO: These errors need to be dispatched to the right
+                                        // WindowKind and id somehow, for correct reporting
+                                        AgentEvent::ErrorHappend(
+                                            "Error with the neovim connection".to_string(),
+                                        )
+                                        .into_event(id)
+                                    }
+                                }
+                            } else {
+                                match client.command(&command).await {
+                                    Ok(_) => callback("tset".to_string(), id),
+                                    Err(e) => Event::Error(format!(
+                                        "Error when sending command to neovim: {}",
+                                        e
+                                    )),
+                                }
                             }
                         },
                         |event| event,
@@ -156,44 +204,78 @@ impl ShellApp {
                 }
                 Task::none()
             }
-            Event::AskClanker(id, kind, prev_id, prompt) => {
-                let client = self.aiclient.clone_box();
+            Event::AskClanker(id, kind, prev_id, prompt, callback) => {
+                tracing::trace!("asking the clanker");
+                let ai_client = self.aiclient.clone_box();
+                let neovim_client = self.neovim.clone();
                 // TODO: do the prompt transformation here, include files, lsp queries etc...
                 let task1 = Task::perform(
                     async move {
-                        let s = prompt.expand();
-                        let mut request = Request::new(s);
+                        // build the prompt
+                        let mut buf = String::default();
+                        for segment in prompt.segments {
+                            match segment.kind {
+                                prompt::SegmentKind::Text => {
+                                    buf.push_str(segment.expand(&prompt.raw))
+                                }
+                                prompt::SegmentKind::File => buf.push_str("file"),
+                                prompt::SegmentKind::Lsp => buf.push_str("lsp"),
+                                prompt::SegmentKind::Selected => {
+                                    if let Some(ref client) = neovim_client {
+                                        match client.command_output("SgGet selected").await {
+                                            Ok(r) => {
+                                                let response: NvimResponse =
+                                                    match serde_json::from_str(&r) {
+                                                        Ok(r) => r,
+                                                        Err(e) => {
+                                                            tracing::error!("{}", e);
+                                                            return kind.create_user_error(
+                                                                "Something went wrong with deserialization".to_string(),
+                                                                id,
+                                                            );
+                                                        }
+                                                    };
+                                                tracing::info!("response from neovim : {}", &r);
+                                                tracing::info!("json: {:#?}", response);
+
+                                                buf = response.content_as_md();
+                                            }
+                                            Err(e) => {
+                                                // neovim call err
+                                                tracing::error!("Error from neovim : {}", &e);
+                                                return kind.create_user_error(
+                                                    format!("neovim error: {}", e),
+                                                    id,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                        }
+                        let mut request = Request::new(buf);
                         request.prev_id = prev_id;
-                        match client.send(request).await {
-                            Ok(r) => r,
+                        tracing::info!("request: {:?}", &request);
+                        match ai_client.send(request).await {
+                            Ok(r) => callback(r, id),
                             Err(e) => {
                                 tracing::error!("{:?}", e);
                                 panic!("send request fail")
-                                // Response::error(&format!("{e:?}"))
                             }
                         }
                     },
-                    move |event| {
-                        if kind == WindowKind::Agent {
-                            AgentEvent::ResponseRecived(event).into_event(id)
-                        } else {
-                            Event::Noop
-                        }
-                    },
+                    //event is the callback
+                    move |event| event,
                 );
 
-                let task2 = if kind == WindowKind::Agent {
-                    Task::done(AgentEvent::PressedSend.into_event(id))
-                } else {
-                    Task::none()
-                };
-
-                Task::batch([task2, task1])
+                Task::batch([task1])
             }
             Event::WindowEvent(id, event) => {
                 // tracing::info!("{:?}", event);
                 match event {
-                    window::Event::Closed => {}
+                    window::Event::Closed => {
+                        self.wm.remove(&id);
+                    }
                     window::Event::RedrawRequested(_instant) => {}
                     window::Event::CloseRequested => {}
                     window::Event::Focused => self.focused_window = Some(id),
@@ -214,10 +296,14 @@ impl ShellApp {
                             ..
                         } => {
                             if key == Key::Named(Named::Enter) {
-                                self.wm
-                                    .update(id, ChildEvent::Agent(AgentEvent::PressedSend))
+                                tracing::info!("mac enter pressed");
+                                return self
+                                    .wm
+                                    .update(id, ChildEvent::Agent(AgentEvent::PressedSend));
                             }
-                            if key == Key::Character("p".into()) {}
+                            if key == Key::Character("p".into()) {
+                                tracing::info!("p pressed");
+                            }
                         }
                         keyboard::Event::KeyReleased { .. } => {}
                         keyboard::Event::ModifiersChanged(_modifiers) => {}
@@ -263,8 +349,19 @@ enum Event {
     NeovimWorkerReady(Sender<String>),
     ChildEvent(Id, ChildEvent),
     NeovimClientReady(Neovim<Compat<tokio::fs::File>>),
-    RequestSendNeovimCommand(String),
-    AskClanker(Id, WindowKind, Option<String>, Prompt),
+    RequestSendNeovimCommand {
+        command: String,
+        arg: Option<String>,
+        id: Id,
+        callback: fn(String, Id) -> Event,
+    },
+    AskClanker(
+        Id,
+        WindowKind,
+        Option<String>,
+        Prompt,
+        fn(Response, Id) -> Event,
+    ),
     Animate,
     WindowEvent(Id, iced::window::Event),
     KbdEvent(iced::keyboard::Event),
@@ -291,11 +388,10 @@ impl Debug for Event {
                 f.debug_tuple("ChildEvent").field(arg0).field(arg1).finish()
             }
             Self::NeovimClientReady(_arg0) => f.debug_tuple("NeovimClientReady").finish(),
-            Self::RequestSendNeovimCommand(arg0) => f
-                .debug_tuple("RequestSendNeovimCommand")
-                .field(arg0)
-                .finish(),
-            Self::AskClanker(_, _, _, _) => write!(f, "clanker"),
+            Self::RequestSendNeovimCommand { .. } => {
+                f.debug_tuple("RequestSendNeovimCommand").finish()
+            }
+            Self::AskClanker(_, _, _, _, _) => write!(f, "clanker"),
             _ => write!(f, "debug not implemented"),
         }
     }
@@ -333,6 +429,7 @@ fn main() -> iced::Result {
     let _ = tracing::subscriber::set_global_default(subscriber);
 
     iced::daemon(ShellApp::new, ShellApp::update, ShellApp::view)
+        .theme(ShellApp::theme)
         .subscription(ShellApp::sub)
         .run()
 }
@@ -395,5 +492,3 @@ fn nvim_worker() -> impl Stream<Item = Event> {
         }
     })
 }
-
-struct Session {}

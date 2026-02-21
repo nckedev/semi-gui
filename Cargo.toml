@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1.89"
 dotenv = "0.15.0"
-iced = { version = "0.14.0", features = ["tokio", "debug", "advanced" ]}
+iced = { version = "0.14.0", features = ["tokio", "debug", "advanced", "svg", "markdown", "highlighter", "canvas" ]}
 iced_futures = "0.14.0"
 nvim-rs = { version = "0.9.2", features = ["use_tokio"]}
 reqwest = { version = "0.13.2", features = ["json"]}
@@ -17,6 +17,7 @@ tokio = { version = "1.49.0", features = ["full"]}
 tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
 iced_ext = { git ="https://github.com/nckedev/iced_ext.git", branch="master" }
+rand = "0.10.0"
 
 [features]
 debug = ["iced/hot"]

@@ -38,7 +38,7 @@ impl SgWindow {
     fn view(&self) -> Element<'_, Event> {
         match self {
             SgWindow::Agent(agent) => agent.view(),
-            SgWindow::Settings(settings) => settings.view(),
+            SgWindow::Settings(settings) => settings.view().into(),
         }
     }
 

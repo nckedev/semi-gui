@@ -41,6 +41,7 @@ use crate::{
     ai::ai::{AiClient, ClientBuilder, Request, Response},
     nvim_types::NvimResponse,
     prompt::Prompt,
+    settings::settings::SettingsEvent,
     window_manager::{SgWindow, WindowKind, WindowManager},
 };
 
@@ -161,7 +162,7 @@ impl ShellApp {
                 self.wm.insert(id, window);
                 Task::none()
             }
-            Event::WindowClosed(id) => window::close(id),
+            Event::CloseWindowRequested(id) => window::close(id),
             Event::ChildEvent(id, child) => self.wm.update(id, child),
             Event::NeovimClientReady(client) => {
                 self.neovim = Some(client);
@@ -260,7 +261,7 @@ impl ShellApp {
                             Ok(r) => callback(r, id),
                             Err(e) => {
                                 tracing::error!("{:?}", e);
-                                panic!("send request fail")
+                                kind.create_user_error(format!("ai client failed: {:?}", e), id)
                             }
                         }
                     },
@@ -345,7 +346,7 @@ enum Event {
         id: Id,
         kind: WindowKind,
     },
-    WindowClosed(Id),
+    CloseWindowRequested(Id),
     NeovimWorkerReady(Sender<String>),
     ChildEvent(Id, ChildEvent),
     NeovimClientReady(Neovim<Compat<tokio::fs::File>>),
@@ -382,7 +383,7 @@ impl Debug for Event {
                 .field("id", id)
                 .field("kind", kind)
                 .finish(),
-            Self::WindowClosed(arg0) => f.debug_tuple("WindowClosed").field(arg0).finish(),
+            Self::CloseWindowRequested(arg0) => f.debug_tuple("WindowClosed").field(arg0).finish(),
             Self::NeovimWorkerReady(arg0) => f.debug_tuple("NeovimHostReady").field(arg0).finish(),
             Self::ChildEvent(arg0, arg1) => {
                 f.debug_tuple("ChildEvent").field(arg0).field(arg1).finish()
@@ -400,6 +401,7 @@ impl Debug for Event {
 #[derive(Debug, Clone)]
 enum ChildEvent {
     Agent(AgentEvent),
+    Settings(SettingsEvent),
     Chat,
 }
 

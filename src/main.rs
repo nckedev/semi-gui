@@ -142,16 +142,18 @@ impl ShellApp {
                 )
             }
             Event::OpenWindowRequested(kind) => {
-                match kind {
+                let settings = match kind {
                     // settings can only have once instance
                     WindowKind::Settings => {
                         if let Some(id) = self.wm.find_first(kind) {
                             return window::gain_focus(id);
                         }
+                        window::Settings::default()
                     }
-                    _ => {}
-                }
-                let (_id, open) = window::open(window::Settings::default());
+                    _ => window::Settings::default(),
+                };
+
+                let (_id, open) = window::open(settings);
                 open.map(move |id| Event::WindowOpened { id, kind })
             }
             Event::WindowOpened { id, kind } => {

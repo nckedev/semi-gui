@@ -27,6 +27,14 @@ impl WindowKind {
             _ => todo!("not implemented yet"),
         }
     }
+
+    pub fn title(&self) -> String {
+        let str = match self {
+            WindowKind::Agent => "Agent",
+            WindowKind::Settings => "Settings",
+        };
+        String::from(str)
+    }
 }
 
 pub enum SgWindow {
